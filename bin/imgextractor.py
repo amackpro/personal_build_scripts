@@ -10,7 +10,7 @@ import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 import ext4
 import string
-
+import time
 EXT4_HEADER_MAGIC = 0xED26FF3A
 EXT4_SPARSE_HEADER_LEN = 28
 EXT4_CHUNK_HEADER_SIZE = 12
@@ -44,20 +44,17 @@ class Extractor(object):
         self.OUTPUT_IMAGE_FILE = ""
         self.EXTRACT_DIR = ""
         self.BLOCK_SIZE = 4096
-        self.TYPE_IMG = 'system'
         self.context = []
         self.fsconfig = []
         self.extraction_tasks = []
-        self.isSAR = False
-        self.spaces_file = ""
 
     def add_context(self, path, con, is_dir):
         safe = path
         for c in "\\^$.|?*+(){}[]":
             safe = safe.replace(c, '\\' + c)
         if is_dir:
-            self.context.append(f'/{safe}(/.*)? {con}')
             self.context.append(f'/{safe} {con}')
+            self.context.append(f'/{safe}(/.*)? {con}')
         else:
             self.context.append(f'/{safe} {con}')
 
@@ -113,7 +110,11 @@ class Extractor(object):
     def scan_and_collect(self, root_inode, root_path=""):
         fuking_symbols = "\\^$.|?*+(){}[]"
         for entry_name, entry_inode_idx, entry_type in root_inode.open_dir():
-            if entry_name in ['.', '..', 'lost+found'] or entry_name.endswith(" (2)"):
+            if (
+                entry_name in ['.', '..']
+                or entry_name.endswith(" (2)")
+                or entry_name == "lost+found"
+                ):
                 continue
 
             entry_inode = root_inode.volume.get_inode(entry_inode_idx, entry_type)
@@ -123,8 +124,8 @@ class Extractor(object):
             uid = entry_inode.inode.i_uid
             gid = entry_inode.inode.i_gid
 
-            con = ""
-            cap = ""
+            con = ''
+            cap = ''
 
             for xattr_key, xattr_val in entry_inode.xattrs():
                 if xattr_key == "security.selinux":
@@ -137,10 +138,10 @@ class Extractor(object):
                         hexv = hex(int("%04x%04x%04x" % (raw[3], raw[2], raw[1]), 16))
                     cap = " capabilities=%s" % hexv
 
-            tmppath = self.FileName + entry_inode_path
-            if ' ' in tmppath:
-                self.__appendf(tmppath, self.spaces_file)
-                tmppath = tmppath.replace(" ", "_")
+            tmppath=self.FileName + entry_inode_path
+            if (tmppath).find(' ',1,len(tmppath))>0:
+                self.__appendf(tmppath, spaces_file)
+                tmppath=tmppath.replace(' ', '_')
 
             if entry_inode.is_dir:
                 target = self.EXTRACT_DIR + entry_inode_path.replace(" ", "_")
@@ -151,7 +152,7 @@ class Extractor(object):
                     os.chmod(target, int(mode, 8))
                     try:
                         os.chown(target, uid, gid)
-                    except:
+                    except PermissionError:
                         pass
 
                 if cap:
@@ -180,14 +181,14 @@ class Extractor(object):
             if entry_inode.is_symlink:
                 try:
                     link_target = entry_inode.open_read().read().decode("utf8")
-                except:
+                except PermissionError:
                     continue  # Skip invalid symlinks
 
                 target = self.EXTRACT_DIR + entry_inode_path.replace(" ", "_")
                 if os.path.islink(target) or os.path.exists(target):
                     try:
                         os.remove(target)
-                    except:
+                    except PermissionError:
                         pass
 
                 if os.name == 'posix':
@@ -215,7 +216,6 @@ class Extractor(object):
     @staticmethod
     def extract_worker(extract_dir, image_file, tasks):
         try:
-            import ext4
             with open(image_file, 'rb') as f:
                 volume = ext4.Volume(f)
                 for entry_path, inode_idx, entry_type, uid, gid, mode in tasks:
@@ -259,6 +259,7 @@ class Extractor(object):
         except:
             pass
 
+
     def __ext4extractor(self):
         config_dir = os.path.dirname(self.EXTRACT_DIR) + os.sep + "config" + os.sep
         if not os.path.isdir(config_dir):
@@ -267,27 +268,10 @@ class Extractor(object):
         contexts = config_dir + self.FileName + "_file_contexts"
         size = config_dir + self.FileName + "_size.txt"
         name = config_dir + self.FileName + "_name.txt"
-        self.spaces_file = config_dir + self.FileName + "_space.txt"
+        spaces_file = config_dir  + self.FileName + "_space.txt"
 
         self.__appendf(os.path.getsize(self.OUTPUT_IMAGE_FILE), size)
         self.__appendf(os.path.basename(self.OUTPUT_IMAGE_FILE).rsplit('.', 1)[0], name)
-
-        print("🔍 Scanning filesystem (single-threaded metadata)...")
-        with open(self.OUTPUT_IMAGE_FILE, 'rb') as file:
-            root = ext4.Volume(file).root
-            self.scan_and_collect(root)
-
-        print(f"✅ Metadata complete: {len(self.fsconfig)} fsconfig + {len(self.context)} contexts + {len(self.extraction_tasks)} tasks")
-
-        print("🚀 Parallel extraction...")
-        num_workers = min(mp.cpu_count(), 8)
-        batch_size = max(1, len(self.extraction_tasks) // num_workers)
-        batches = [self.extraction_tasks[i:i + batch_size] for i in range(0, len(self.extraction_tasks), batch_size)]
-        with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(self.extract_worker, self.EXTRACT_DIR, self.OUTPUT_IMAGE_FILE, batch) for batch in batches]
-            for future in futures:
-                future.result()
-
         def dedupe_keep_order(seq):
             seen = set()
             out = []
@@ -296,16 +280,37 @@ class Extractor(object):
                     seen.add(x)
                     out.append(x)
             return out
+        print("🔍 Scanning filesystem (single-threaded metadata)...")
 
+        with open(self.OUTPUT_IMAGE_FILE, 'rb') as file:
+            root = ext4.Volume(file).root
+            self.scan_and_collect(root)
+        if hasattr(self, 'USER_THREADS') and self.USER_THREADS:
+            num_workers = max(1, int(self.USER_THREADS))
+        else:
+            num_workers = min(mp.cpu_count(), 8)
+        print("🚀 Parallel extraction using Threads : ", num_workers)
+        batch_size = max(1, len(self.extraction_tasks) // num_workers)
+        batches = [self.extraction_tasks[i:i + batch_size] for i in range(0, len(self.extraction_tasks), batch_size)]
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(self.extract_worker,self.EXTRACT_DIR,self.OUTPUT_IMAGE_FILE,batch)for batch in batches]
+            for future in futures:
+                future.result()
         self.fsconfig = dedupe_keep_order(self.fsconfig)
         self.context = dedupe_keep_order(self.context)
 
         print("💾 Writing configs...")
+        root_line = "/ 0 0 0755"
+        partition_line = self.FileName + " 0 0 0755"
+        final_fs = [root_line, partition_line]
+        for line in sorted(self.fsconfig):
+            if line not in final_fs:
+                final_fs.append(line)
+        self.__appendf("\n".join(final_fs), fs_config_file)
         self.fsconfig.sort()
-        self.__appendf('\n'.join(self.fsconfig), fs_config_file)
 
-        self.context.sort()
         self.__appendf('\n'.join(self.context), contexts)
+        self.context.sort()
 
     def __converSimgToImg(self, target):
         with open(target, "rb") as img_file:
@@ -354,24 +359,67 @@ class Extractor(object):
             return 'simg' if header.magic == EXT4_HEADER_MAGIC else 'img'
 
     def main(self, target, output_dir):
-        self.BASE_DIR = (os.path.realpath(os.path.dirname(target)) + os.sep)
-        self.EXTRACT_DIR = os.path.realpath(os.path.dirname(output_dir)) + os.sep + self.__file_name(os.path.basename(output_dir))
-        self.OUTPUT_IMAGE_FILE = self.BASE_DIR + os.path.basename(target)
+        self.BASE_DIR = os.path.realpath(os.path.dirname(target)) + os.sep
+        self.OUTPUT_IMAGE_FILE = os.path.join(self.BASE_DIR, os.path.basename(target))
         self.FileName = self.__file_name(os.path.basename(target))
+
+        output_base = os.path.realpath(output_dir)
+        self.EXTRACT_DIR = os.path.join(output_base, self.FileName)
 
         os.makedirs(self.EXTRACT_DIR, exist_ok=True)
 
+        start = time.time()
         target_type = self.__getTypeTarget(target)
         if target_type == 'simg':
             self.__converSimgToImg(target)
         self.__ext4extractor()
+        end = time.time()          # end time
+        elapsed = end - start      # seconds as float
+        print(f"⏱ Time taken: {elapsed:.3f} seconds")
 
 if __name__ == '__main__':
-    if sys.argv.__len__() == 3:
-        Extractor().main(sys.argv[1], (sys.argv[2] + os.sep + os.path.basename(sys.argv[1])))
-    else:
-        if sys.argv.__len__() == 2:
-            Extractor().main(sys.argv[1], os.path.realpath(os.path.dirname(sys.argv[1])) + os.sep + os.path.basename(sys.argv[1]))
-        else:
-            print("Must be at least 1 argument...")
-            sys.exit(1)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Ext4 image extractor with multiprocessing")
+
+    parser.add_argument(
+        "-i", "--input",
+        required=False,
+        help="Path to input ext4 image"
+    )
+
+    parser.add_argument(
+        "-o", "--output",
+        required=False,
+        help="Output directory for extraction"
+    )
+
+    parser.add_argument(
+        "-T", "--threads",
+        required=False,
+        type=int,
+        default=None,
+        help="Number of parallel workers (default: auto)"
+    )
+
+    # For backward compatibility, allow old syntax: imgextractor.py input.img outdir
+    args, leftovers = parser.parse_known_args()
+
+    if args.input is None and len(leftovers) >= 1:
+        args.input = leftovers[0]
+
+    if args.output is None and len(leftovers) >= 2:
+        args.output = leftovers[1]
+
+    if not args.input:
+        print("❌ Error: No input image provided.")
+        print("Use: python imgextractor.py -i system.img -o out_dir [-T 8]")
+        sys.exit(1)
+
+    Extractor.USER_THREADS = args.threads
+
+    outdir = args.output if args.output else (
+        os.path.realpath(os.path.dirname(args.input)) + os.sep + os.path.basename(args.input)
+    )
+
+    Extractor().main(args.input, outdir)
