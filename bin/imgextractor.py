@@ -265,7 +265,7 @@ class Extractor(object):
         if not os.path.isdir(config_dir):
             os.makedirs(config_dir)
         fs_config_file = config_dir + self.FileName + "_fs_config"
-        contexts = config_dir + self.FileName + "_file_contexts"
+        file_contexts_file = config_dir + self.FileName + "_file_contexts"
         size = config_dir + self.FileName + "_size.txt"
         name = config_dir + self.FileName + "_name.txt"
         spaces_file = config_dir  + self.FileName + "_space.txt"
@@ -308,8 +308,12 @@ class Extractor(object):
                 final_fs.append(line)
         self.__appendf("\n".join(final_fs), fs_config_file)
         self.fsconfig.sort()
-
-        self.__appendf('\n'.join(self.context), contexts)
+        for c in self.context:
+            if re.search('^/'+self.FileName+'/bin ', c):
+                self.context.insert(0, '/' + self.FileName +'(/.*)? ' + c.split(" ")[1])
+                self.context.insert(0, '/' + self.FileName + ' ' + c.split(" ")[1])
+                break
+        self.__appendf('\n'.join(self.context), file_contexts_file)
         self.context.sort()
 
     def __converSimgToImg(self, target):
